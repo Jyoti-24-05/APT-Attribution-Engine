@@ -1,12 +1,18 @@
+"""
+app.py — APT Attribution Engine · Home Page
+MITRE ATT&CK Orange Dark Theme
+Run: streamlit run app.py
+"""
 
-import json
-import pathlib
+import json, pathlib, re, warnings
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+import joblib
 from inference import predict_top3
 
-# ── page config ───────────────────────────────────────────────
+warnings.filterwarnings("ignore")
+
 st.set_page_config(
     page_title="APT Attribution Engine",
     page_icon="",
@@ -14,261 +20,478 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── load supporting artifacts ─────────────────────────────────
 ROOT      = pathlib.Path(__file__).parent.resolve()
 ARTIFACTS = ROOT / "artifacts"
 
 @st.cache_resource(show_spinner=False)
-def load_eval_summary():
-    p = ARTIFACTS / "eval_summary.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+def load_artifacts():
+    ev = json.loads((ARTIFACTS/"eval_summary.json").read_text()) if (ARTIFACTS/"eval_summary.json").exists() else {}
+    fv = joblib.load(ARTIFACTS/"feature_vocab.joblib") if (ARTIFACTS/"feature_vocab.joblib").exists() else {}
+    gc = json.loads((ARTIFACTS/"group_tech_counts.json").read_text()) if (ARTIFACTS/"group_tech_counts.json").exists() else {}
+    return ev, fv, gc
 
-@st.cache_resource(show_spinner=False)
-def load_shap_table():
-    p = ARTIFACTS / "shap_importance.json"
-    return json.loads(p.read_text()) if p.exists() else []
+eval_summary, feature_vocab, group_counts = load_artifacts()
 
-eval_summary = load_eval_summary()
-shap_table   = load_shap_table()
-
-# ── preset known APT signatures ───────────────────────────────
-PRESETS = {
-    "APT28 — Fancy Bear (Russia)": [
-        "T1059","T1078","T1566","T1053","T1027",
-        "T1105","T1036","T1016","T1057","T1083",
-    ],
-    "Lazarus Group (North Korea)": [
-        "T1059","T1003","T1071","T1041","T1105",
-        "T1547","T1055","T1070","T1140","T1486",
-    ],
-    "APT29 — Cozy Bear (Russia)": [
-        "T1078","T1566","T1027","T1036","T1071",
-        "T1090","T1102","T1560","T1048","T1070",
-    ],
-    "APT41 — Winnti (China)": [
-        "T1059","T1078","T1021","T1047","T1053",
-        "T1027","T1036","T1055","T1070","T1112",
-    ],
-    "Minimal incident — 2 techniques": [
-        "T1059","T1003",
-    ],
+# ─── APT group → country/region mapping ─────────────────────────────────────
+APT_COUNTRY = {
+    # Russia
+    "APT28":"Russia","APT29":"Russia","Sandworm Team":"Russia","Turla":"Russia",
+    "Gamaredon Group":"Russia","HAFNIUM":"Russia","Cozy Bear":"Russia",
+    "Fancy Bear":"Russia","Ember Bear":"Russia","IRON TILDEN":"Russia",
+    "Dragonfly":"Russia","Energetic Bear":"Russia","Berserk Bear":"Russia",
+    # China
+    "APT1":"China","APT10":"China","APT17":"China","APT19":"China",
+    "APT40":"China","APT41":"China","APT3":"China","APT30":"China",
+    "Winnti Group":"China","BRONZE BUTLER":"China","Ke3chang":"China",
+    "Leviathan":"China","Mustang Panda":"China","TA413":"China",
+    "Threat Group-3390":"China","menuPass":"China","Deep Panda":"China",
+    "Elderwood":"China","GALLIUM":"China","TEMP.Veles":"Russia",
+    # North Korea
+    "Lazarus Group":"North Korea","Kimsuky":"North Korea","APT37":"North Korea",
+    "APT38":"North Korea","TEMP.Hermit":"North Korea","Andariel":"North Korea",
+    "BlueNoroff":"North Korea","DarkHotel":"North Korea",
+    # Iran
+    "APT33":"Iran","APT34":"Iran","APT35":"Iran","APT39":"Iran",
+    "Charming Kitten":"Iran","MuddyWater":"Iran","OilRig":"Iran",
+    "Magic Hound":"Iran","HEXANE":"Iran","Agrius":"Iran","Pioneer Kitten":"Iran",
+    # USA / Five Eyes (cybercriminal or state-adjacent)
+    "Equation Group":"USA","Longhorn":"USA","The Lamberts":"USA",
+    # Vietnam
+    "APT32":"Vietnam","OceanLotus":"Vietnam","APT-C-00":"Vietnam",
+    # Pakistan
+    "Sidewinder":"Pakistan","Transparent Tribe":"Pakistan",
+    # India
+    "Donot Team":"India",
+    # Turkey
+    "Sea Turtle":"Turkey","PROMETHIUM":"Turkey",
+    # Lebanon
+    "Dark Caracal":"Lebanon",
+    # Gaza / Palestinian
+    "Gaza Cybergang":"Palestinian Territory","Molerats":"Palestinian Territory",
+    # Multiple / Unknown
+    "FIN7":"Unknown","FIN6":"Unknown","FIN4":"Unknown","Carbanak":"Unknown",
+    "Cobalt Group":"Unknown","TA505":"Unknown","Silence":"Unknown",
+    "DarkHydrus":"Unknown","Gorgon Group":"Unknown","CopyKittens":"Unknown",
 }
 
-RANK_COLORS  = ["#1D9E75", "#378ADD", "#888780"]
-RANK_BG      = ["rgba(29,158,117,0.08)", "rgba(55,138,221,0.07)", "rgba(136,135,128,0.07)"]
-RANK_MEDALS  = ["", "", ""]
+COUNTRY_COORDS = {
+    "Russia":               (61.52, 105.32),
+    "China":                (35.86, 104.19),
+    "North Korea":          (40.34, 127.51),
+    "Iran":                 (32.43, 53.69),
+    "USA":                  (37.09, -95.71),
+    "Vietnam":              (14.06, 108.28),
+    "Pakistan":             (30.38, 69.35),
+    "India":                (20.59, 78.96),
+    "Turkey":               (38.96, 35.24),
+    "Lebanon":              (33.85, 35.86),
+    "Palestinian Territory":(31.95, 35.23),
+    "Unknown":              (0.0,   0.0),
+}
 
-# ── global CSS ────────────────────────────────────────────────
+COUNTRY_COLOR = {
+    "Russia":"#E8451A","China":"#FF6B1A","North Korea":"#D84315",
+    "Iran":"#F4511E","USA":"#BF360C","Vietnam":"#FF7043",
+    "Pakistan":"#FFAB40","India":"#FFD180","Turkey":"#FF9800",
+    "Lebanon":"#FFB74D","Palestinian Territory":"#FFCC02","Unknown":"#555",
+}
+
+PRESETS = {
+    "APT28 — Fancy Bear (Russia)":    ["T1059","T1078","T1566","T1053","T1027","T1105","T1036","T1016","T1057","T1083"],
+    "Lazarus Group (North Korea)":    ["T1059","T1003","T1071","T1041","T1105","T1547","T1055","T1070","T1140","T1486"],
+    "APT29 — Cozy Bear (Russia)":     ["T1078","T1566","T1027","T1036","T1071","T1090","T1102","T1560","T1048","T1070"],
+    "APT41 — Winnti (China)":         ["T1059","T1078","T1021","T1047","T1053","T1027","T1036","T1055","T1070","T1112"],
+    "MuddyWater (Iran)":              ["T1059","T1036","T1027","T1105","T1070","T1047","T1053","T1016","T1057","T1083"],
+    "Minimal incident — 2 techniques":["T1059","T1003"],
+}
+
+RANK_COLORS = ["#FF6B1A","#FF9800","#FFAB40"]
+RANK_BG     = ["rgba(255,107,26,0.10)","rgba(255,152,0,0.08)","rgba(255,171,64,0.06)"]
+RANK_MEDALS = ["","",""]
+
+# ─── CSS ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
 
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+/* Base */
+html, body, [class*="css"], .stApp {
+    font-family: 'Inter', sans-serif;
+    background-color: #0D0D0D !important;
+    color: #E8E0D8 !important;
+}
+section[data-testid="stSidebar"] {
+    background-color: #111111 !important;
+    border-right: 1px solid #1E1E1E !important;
+}
+section[data-testid="stSidebar"] * { color: #E8E0D8 !important; }
 
-/* ── top banner ────────────── */
+/* Banner */
 .banner {
-    background: linear-gradient(135deg, #0A0F1E 0%, #0D2137 60%, #0A2B1A 100%);
+    background: linear-gradient(135deg, #111 0%, #1A0E00 60%, #200A00 100%);
+    border: 1px solid #FF6B1A33;
     border-radius: 12px;
     padding: 28px 32px 24px;
     margin-bottom: 24px;
-    border: 1px solid rgba(29,158,117,0.2);
-    position: relative;
-    overflow: hidden;
+    position: relative; overflow: hidden;
 }
 .banner::before {
-    content: "";
-    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    content:"";
+    position:absolute; inset:0;
     background: repeating-linear-gradient(
-        0deg, transparent, transparent 24px,
-        rgba(29,158,117,0.04) 24px, rgba(29,158,117,0.04) 25px
+        90deg, transparent, transparent 40px,
+        rgba(255,107,26,0.03) 40px, rgba(255,107,26,0.03) 41px
     );
-    pointer-events: none;
+    pointer-events:none;
 }
-.banner-eyebrow {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px; letter-spacing: 0.15em;
-    color: #1D9E75; text-transform: uppercase;
-    margin-bottom: 8px;
+.banner-eye {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:10px; letter-spacing:.18em; color:#FF6B1A;
+    text-transform:uppercase; margin-bottom:8px;
 }
 .banner-title {
-    font-size: 26px; font-weight: 600; color: #F0F4F8;
-    line-height: 1.2; margin-bottom: 6px;
+    font-size:30px; font-weight:700; color:#FFF;
+    letter-spacing:-0.5px; margin-bottom:4px;
 }
 .banner-sub {
-    font-size: 13px; color: rgba(240,244,248,0.5);
-    font-family: 'IBM Plex Mono', monospace;
+    font-size:12px; color:#8A7A6A;
+    font-family:'IBM Plex Mono',monospace;
+}
+.metric-row { display:flex; gap:10px; margin-top:20px; flex-wrap:wrap; }
+.mpill {
+    background:rgba(255,107,26,0.07);
+    border:1px solid rgba(255,107,26,0.2);
+    border-radius:8px; padding:10px 18px; min-width:100px;
+}
+.mpill .val {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:22px; font-weight:600; color:#FF6B1A;
+}
+.mpill .lbl {
+    font-size:10px; color:#6A5A4A;
+    text-transform:uppercase; letter-spacing:.1em; margin-top:2px;
 }
 
-/* ── metric pill ───────────── */
-.metric-row { display: flex; gap: 10px; margin-top: 16px; }
-.metric-pill {
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 8px; padding: 10px 16px; flex: 1;
-}
-.metric-pill .val {
-    font-size: 22px; font-weight: 600; color: #F0F4F8;
-    font-family: 'IBM Plex Mono', monospace;
-}
-.metric-pill .lbl {
-    font-size: 10px; color: rgba(240,244,248,0.45);
-    text-transform: uppercase; letter-spacing: 0.1em; margin-top: 2px;
+/* Section labels */
+.sec-lbl {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:10px; font-weight:600; letter-spacing:.15em;
+    text-transform:uppercase; color:#FF6B1A; margin-bottom:10px;
 }
 
-/* ── result cards ──────────── */
-.result-card {
-    border-radius: 10px; padding: 16px 20px;
-    margin-bottom: 10px; border-left: 4px solid;
-    position: relative;
+/* Result cards */
+.rcard {
+    border-radius:10px; padding:16px 20px;
+    margin-bottom:10px; border-left:4px solid;
 }
-.result-card .rank-badge {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 10px; letter-spacing: 0.12em;
-    text-transform: uppercase; opacity: 0.55; margin-bottom: 4px;
+.rcard .rbadge {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:9px; letter-spacing:.15em; text-transform:uppercase;
+    opacity:.5; margin-bottom:4px; color:#E8E0D8;
 }
-.result-card .group-name {
-    font-size: 17px; font-weight: 500; margin-bottom: 2px;
+.rcard .rname { font-size:17px; font-weight:600; color:#FFF; margin-bottom:2px; }
+.rcard .rconf {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:11px; color:#8A7A6A; margin-top:4px;
 }
-.result-card .conf-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px; opacity: 0.55; margin-top: 4px;
+.rcard .rbar-bg {
+    height:3px; background:rgba(255,255,255,0.07);
+    border-radius:2px; margin-top:10px; overflow:hidden;
 }
-.result-card .conf-bar-bg {
-    height: 3px; background: rgba(128,128,128,0.15);
-    border-radius: 2px; margin-top: 10px; overflow: hidden;
-}
-.result-card .conf-bar-fill {
-    height: 100%; border-radius: 2px; transition: width 0.4s ease;
+.rcard .rbar-fill { height:100%; border-radius:2px; }
+
+/* Empty state */
+.empty-state {
+    border:1.5px dashed rgba(255,107,26,0.2);
+    border-radius:10px; padding:48px 20px;
+    text-align:center; color:rgba(255,107,26,0.35);
 }
 
-/* ── input area ────────────── */
-.section-label {
-    font-size: 11px; font-weight: 600;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: rgba(128,128,128,0.7); margin-bottom: 8px;
+/* Sidebar nav */
+.snav-lbl {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:9px; font-weight:600; letter-spacing:.15em;
+    text-transform:uppercase; color:#FF6B1A !important;
+    margin-bottom:6px; margin-top:16px; display:block;
 }
 
-/* ── sidebar ───────────────── */
-.sidebar-head {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px; color: #1D9E75;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    margin-bottom: 12px;
+/* Buttons */
+.stButton>button {
+    background:#FF6B1A !important;
+    color:#000 !important;
+    font-weight:600 !important;
+    border:none !important;
+    border-radius:6px !important;
+}
+.stButton>button:hover { background:#FF8C42 !important; }
+
+/* Input */
+.stTextArea textarea {
+    background:#161616 !important;
+    border:1px solid #2A2A2A !important;
+    color:#E8E0D8 !important;
+    font-family:'IBM Plex Mono',monospace !important;
+    font-size:13px !important;
+    border-radius:8px !important;
+}
+.stTextArea textarea:focus { border-color:#FF6B1A !important; }
+
+/* Selectbox */
+.stSelectbox>div>div {
+    background:#161616 !important;
+    border:1px solid #2A2A2A !important;
+    color:#E8E0D8 !important;
+}
+
+/* Expanders */
+.streamlit-expanderHeader {
+    background:#161616 !important;
+    border:1px solid #2A2A2A !important;
+    border-radius:8px !important;
+    color:#E8E0D8 !important;
+}
+.streamlit-expanderContent {
+    background:#111 !important;
+    border:1px solid #2A2A2A !important;
+    border-top:none !important;
+}
+
+/* Divider */
+hr { border-color:#1E1E1E !important; }
+
+/* About accordion */
+.about-item {
+    border:1px solid #222;
+    border-radius:8px;
+    margin-bottom:8px;
+    overflow:hidden;
+}
+.about-item summary {
+    padding:12px 16px;
+    cursor:pointer;
+    font-size:13px; font-weight:600;
+    color:#E8E0D8;
+    background:#161616;
+    list-style:none;
+    display:flex; align-items:center; gap:8px;
+}
+.about-item summary::-webkit-details-marker { display:none; }
+.about-item summary::before { content:"▸"; color:#FF6B1A; font-size:10px; }
+details[open] .about-item summary::before { content:"▾"; }
+.about-item .body {
+    padding:14px 16px; font-size:13px;
+    color:#8A7A6A; background:#111; line-height:1.7;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ── banner ────────────────────────────────────────────────────
-f1_val  = eval_summary.get("macro_f1",     None)
-t3_val  = eval_summary.get("top3_accuracy", None)
-n_test  = eval_summary.get("n_test_samples", "—")
-n_cls   = eval_summary.get("n_classes_in_test", "—")
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("""
+    <div style='padding:16px 0 8px; border-bottom:1px solid #1E1E1E; margin-bottom:8px;'>
+        <div style='font-family:IBM Plex Mono,monospace;font-size:11px;color:#FF6B1A;letter-spacing:.15em;'>
+         APT ATTRIBUTION
+        </div>
+        <div style='font-size:13px;font-weight:600;color:#FFF;margin-top:4px;'>
+        Navigation
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
 
-f1_str = f"{f1_val:.3f}" if isinstance(f1_val, float) else "—"
-t3_str = f"{t3_val:.3f}" if isinstance(t3_val, float) else "—"
+    
+    st.markdown("""
+<div style='display:flex;flex-direction:column;gap:6px;'>
+  <a href='/' target='_self' style='display:block;padding:8px 12px;border-radius:6px;
+     background:rgba(255,107,26,0.12);border:1px solid rgba(255,107,26,0.25);
+     color:#FF6B1A;text-decoration:none;font-size:13px;font-weight:500;'>
+     &nbsp; Home — Attribution</a>
+  <a href='/analytics' target='_self' style='display:block;padding:8px 12px;border-radius:6px;
+     background:rgba(255,255,255,0.04);border:1px solid #2A2A2A;
+     color:#8A7A6A;text-decoration:none;font-size:13px;font-weight:500;'>
+     &nbsp; Analytics &amp; Reports</a>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown('<span class="snav-lbl">Preset Incidents</span>', unsafe_allow_html=True)
+    preset_choice = st.selectbox(
+        "preset", ["— enter manually —"] + list(PRESETS.keys()),
+        label_visibility="collapsed",
+    )
+
+    st.markdown('<span class="snav-lbl"></span>', unsafe_allow_html=True)
+    f1v = eval_summary.get("macro_f1", None)
+    t3v = eval_summary.get("top3_accuracy", None)
+
+# ─── BANNER ──────────────────────────────────────────────────────────────────
+n_test = eval_summary.get("n_test_samples",    "—")
+n_cls  = eval_summary.get("n_classes_in_test", "—")
+f1_s   = f"{f1v:.3f}" if isinstance(f1v, float) else "—"
+t3_s   = f"{t3v:.3f}" if isinstance(t3v, float) else "—"
+n_grp  = len(group_counts) if group_counts else "—"
 
 st.markdown(f"""
 <div class="banner">
-  <div class="banner-eyebrow">MITRE ATT&amp;CK · ML Attribution Engine · v1.0</div>
+  <div class="banner-eye">MITRE ATT&CK · ML Attribution Engine · Enterprise v1.0</div>
   <div class="banner-title">APT Attribution Engine</div>
   <div class="banner-sub">XGBoost + Random Forest + SVM Ensemble &nbsp;·&nbsp; Optuna-tuned &nbsp;·&nbsp; SHAP Explainability</div>
   <div class="metric-row">
-    <div class="metric-pill"><div class="val">{f1_str}</div><div class="lbl">Macro F1</div></div>
-    <div class="metric-pill"><div class="val">{t3_str}</div><div class="lbl">Top-3 Accuracy</div></div>
-    <div class="metric-pill"><div class="val">{n_test}</div><div class="lbl">Test Samples</div></div>
-    <div class="metric-pill"><div class="val">{n_cls}</div><div class="lbl">Attributable Groups</div></div>
+    <div class="mpill"><div class="val">{f1_s}</div><div class="lbl">Macro F1</div></div>
+    <div class="mpill"><div class="val">{t3_s}</div><div class="lbl">Top-3 Acc</div></div>
+    <div class="mpill"><div class="val">{n_grp}</div><div class="lbl">Tracked Groups</div></div>
+    <div class="mpill"><div class="val">{n_test}</div><div class="lbl">Test Samples</div></div>
+    <div class="mpill"><div class="val">{n_cls}</div><div class="lbl">Attributable</div></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── sidebar ───────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="sidebar-head">Preset Incidents</div>', unsafe_allow_html=True)
-    st.caption("Load a known APT technique signature for demo.")
-    preset_choice = st.selectbox(
-        "Select preset", ["— enter manually —"] + list(PRESETS.keys()),
-        label_visibility="collapsed",
-    )
+# ─── WORLD MAP ───────────────────────────────────────────────────────────────
+st.markdown('<div class="sec-lbl"> Global Threat Actor Map</div>', unsafe_allow_html=True)
 
-    st.divider()
-    st.markdown('<div class="sidebar-head">About</div>', unsafe_allow_html=True)
-    st.markdown("""
-**Data source**  
-MITRE ATT&CK STIX 2.1 enterprise bundle
+# Build per-country aggregated data
+country_groups = {}
+for grp, cnt in group_counts.items():
+    country = next((APT_COUNTRY[k] for k in APT_COUNTRY if k.lower() in grp.lower()), None)
+    if not country:
+        country = APT_COUNTRY.get(grp, "Unknown")
+    if country not in country_groups:
+        country_groups[country] = []
+    country_groups[country].append((grp, cnt))
 
-**Feature encoding**  
-Binary technique presence (root IDs only).  
-30 synthetic samples per group via random sub-sampling.
+# One scatter point per group
+lats, lons, texts, colors_list, sizes = [], [], [], [], []
+for grp, cnt in group_counts.items():
+    country = next((APT_COUNTRY[k] for k in APT_COUNTRY if k.lower() in grp.lower()), None)
+    if not country:
+        country = APT_COUNTRY.get(grp, "Unknown")
+    if country == "Unknown":
+        continue
+    coords = COUNTRY_COORDS.get(country, (0, 0))
+    # Jitter so overlapping groups are visible
+    jlat = coords[0] + np.random.uniform(-3, 3)
+    jlon = coords[1] + np.random.uniform(-3, 3)
+    lats.append(jlat)
+    lons.append(jlon)
+    texts.append(f"<b>{grp}</b><br>Country: {country}<br>Techniques: {cnt}")
+    colors_list.append(COUNTRY_COLOR.get(country, "#FF6B1A"))
+    sizes.append(max(8, min(22, cnt // 3 + 7)))
 
-**Model**  
-Soft-voting ensemble:  
-XGBoost + Random Forest + Calibrated SVM
+fig_map = go.Figure()
 
-**Tuning**  
-Optuna · 60 trials · macro F1 objective
+# Country cluster markers (large, semi-transparent)
+for country, grps in country_groups.items():
+    if country == "Unknown":
+        continue
+    coords = COUNTRY_COORDS.get(country, (0, 0))
+    total_tech = sum(c for _, c in grps)
+    fig_map.add_trace(go.Scattergeo(
+        lat=[coords[0]], lon=[coords[1]],
+        mode="markers+text",
+        marker=dict(
+            size=max(20, min(50, len(grps) * 8)),
+            color=COUNTRY_COLOR.get(country, "#FF6B1A"),
+            opacity=0.15,
+            line=dict(width=0),
+        ),
+        text=[country],
+        textposition="top center",
+        textfont=dict(size=10, color=COUNTRY_COLOR.get(country, "#FF6B1A"),
+                      family="IBM Plex Mono"),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
 
-**Explainability**  
-SHAP TreeExplainer on XGBoost base
-""")
+# Individual group dots
+fig_map.add_trace(go.Scattergeo(
+    lat=lats, lon=lons,
+    mode="markers",
+    marker=dict(
+        size=sizes,
+        color=colors_list,
+        opacity=0.85,
+        line=dict(width=1, color="#0D0D0D"),
+    ),
+    text=texts,
+    hovertemplate="%{text}<extra></extra>",
+    showlegend=False,
+))
 
-    st.divider()
-    st.caption("⚠ Groups with < 3 techniques excluded from training. Known limitation documented in engineering report.")
+fig_map.update_geos(
+    projection_type="natural earth",
+    showland=True, landcolor="#1A1400",
+    showocean=True, oceancolor="#0D0D0D",
+    showlakes=False,
+    showcountries=True, countrycolor="#2A2000",
+    showcoastlines=True, coastlinecolor="#2A2000",
+    bgcolor="#0D0D0D",
+    framecolor="#2A2000",
+)
+fig_map.update_layout(
+    paper_bgcolor="#0D0D0D",
+    plot_bgcolor="#0D0D0D",
+    margin=dict(l=0, r=0, t=0, b=0),
+    height=420,
+    geo=dict(bgcolor="#0D0D0D"),
+)
 
-# ── main layout ───────────────────────────────────────────────
+st.plotly_chart(fig_map, use_container_width=True)
+
+# Legend
+legend_countries = [c for c in COUNTRY_COLOR if c != "Unknown"]
+legend_html = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px;">'
+for c in legend_countries:
+    col = COUNTRY_COLOR[c]
+    grp_count = len(country_groups.get(c, []))
+    if grp_count == 0:
+        continue
+    legend_html += f'<div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#8A7A6A;font-family:IBM Plex Mono,monospace;"><span style="width:10px;height:10px;border-radius:50%;background:{col};display:inline-block;"></span>{c} ({grp_count})</div>'
+legend_html += '</div>'
+st.markdown(legend_html, unsafe_allow_html=True)
+
+st.divider()
+
+# ─── ATTRIBUTION ─────────────────────────────────────────────────────────────
 col_left, col_right = st.columns([1, 1], gap="large")
 
-# ── LEFT: input ───────────────────────────────────────────────
 with col_left:
-    st.markdown('<div class="section-label">Incident Technique IDs</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-lbl">Incident Technique IDs</div>', unsafe_allow_html=True)
 
     default_text = ""
-    if preset_choice and preset_choice != "— enter manually —":
+    if preset_choice != "— enter manually —":
         default_text = "\n".join(PRESETS[preset_choice])
 
     raw_input = st.text_area(
-        "technique_ids",
-        value=default_text,
-        height=220,
+        "tids", value=default_text, height=200,
         placeholder="T1059\nT1003\nT1566\nT1071\nT1027",
-        help="One ATT&CK technique ID per line, or comma-separated. Sub-technique IDs (T1059.001) are auto-collapsed to root.",
+        help="One ATT&CK technique ID per line. Sub-techniques (T1059.001) auto-collapsed.",
         label_visibility="collapsed",
     )
 
-    col_btn, col_info = st.columns([2, 3])
-    with col_btn:
+    parsed = []
+    if raw_input.strip():
+        parsed = [t.strip().upper() for t in re.split(r"[\n,]+", raw_input) if t.strip()]
+
+    col_b, col_i = st.columns([2, 3])
+    with col_b:
         run = st.button("Attribute →", type="primary", use_container_width=True)
-    with col_info:
-        if raw_input.strip():
-            import re
-            parsed = [t.strip().upper() for t in re.split(r"[\n,]+", raw_input) if t.strip()]
-            st.caption(f"{len(parsed)} technique ID(s) entered")
-        else:
-            parsed = []
-            st.caption("Enter technique IDs above")
+    with col_i:
+        st.caption(f"{len(parsed)} technique ID(s) entered" if parsed else "Enter technique IDs")
 
-    # How to use expander
-    with st.expander("How to use"):
+    with st.expander("ℹ How to use"):
         st.markdown("""
-**Step 1** — Enter ATT&CK technique IDs from the incident  
-_(e.g. from an EDR alert, SIEM rule, or threat intel report)_
+**1.** Enter ATT&CK technique IDs from your incident  
+**2.** Click **Attribute →**  
+**3.** Review top-3 candidate threat groups with confidence scores
 
-**Step 2** — Click **Attribute →**
+Sub-technique IDs (e.g. `T1059.001`) are automatically collapsed to root (`T1059`).  
+Use the sidebar presets to explore known APT signatures.
+        """)
 
-**Step 3** — Review the top-3 candidate threat groups with confidence scores
-
-**Tips:**
-- More techniques → more confident attribution
-- Sub-technique IDs (T1059.001) are automatically collapsed to root
-- Use the preset panel on the left to explore known APT signatures
-""")
-
-# ── RIGHT: results ────────────────────────────────────────────
 with col_right:
-    st.markdown('<div class="section-label">Attribution Results</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-lbl">Attribution Results</div>', unsafe_allow_html=True)
 
     if run:
         if not parsed:
-            st.warning("Enter at least one technique ID to attribute.")
+            st.warning("Enter at least one technique ID.")
         else:
             with st.spinner("Running inference…"):
                 try:
@@ -276,132 +499,106 @@ with col_right:
 
                     for r in results:
                         pct   = r["confidence"] * 100
-                        color = RANK_COLORS[r["rank"] - 1]
-                        bg    = RANK_BG[r["rank"] - 1]
-                        medal = RANK_MEDALS[r["rank"] - 1]
+                        color = RANK_COLORS[r["rank"]-1]
+                        bg    = RANK_BG[r["rank"]-1]
+                        medal = RANK_MEDALS[r["rank"]-1]
                         bar_w = int(r["confidence"] * 100)
+                        country = next((APT_COUNTRY[k] for k in APT_COUNTRY
+                                        if k.lower() in r["group"].lower()), "Unknown")
+                        flag_note = f"&nbsp;·&nbsp;{country}" if country != "Unknown" else ""
 
                         st.markdown(f"""
-<div class="result-card" style="border-color:{color}; background:{bg};">
-  <div class="rank-badge">{medal} Rank #{r["rank"]}</div>
-  <div class="group-name">{r["group"]}</div>
-  <div class="conf-label">Confidence: {r["confidence"]:.4f} &nbsp;({pct:.1f}%)</div>
-  <div class="conf-bar-bg">
-    <div class="conf-bar-fill" style="width:{bar_w}%; background:{color};"></div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+<div class="rcard" style="border-color:{color};background:{bg};">
+  <div class="rbadge">{medal} Rank #{r["rank"]}</div>
+  <div class="rname">{r["group"]}<span style="font-size:12px;font-weight:400;color:#6A5A4A;">{flag_note}</span></div>
+  <div class="rconf">Confidence: {r["confidence"]:.4f} ({pct:.1f}%)</div>
+  <div class="rbar-bg"><div class="rbar-fill" style="width:{bar_w}%;background:{color};"></div></div>
+</div>""", unsafe_allow_html=True)
 
-                    # Plotly bar chart
+                    # Confidence chart
                     fig = go.Figure(go.Bar(
                         x=[r["confidence"] for r in results],
-                        y=[r["group"]      for r in results],
+                        y=[r["group"] for r in results],
                         orientation="h",
                         marker_color=RANK_COLORS[:len(results)],
                         text=[f"{r['confidence']:.4f}" for r in results],
-                        textposition="outside",
-                        cliponaxis=False,
+                        textposition="outside", cliponaxis=False,
                     ))
-                    max_conf = results[0]["confidence"]
                     fig.update_layout(
-                        xaxis=dict(
-                            title="Confidence (probability)",
-                            range=[0, min(1.0, max_conf * 1.35)],
-                        ),
-                        yaxis=dict(autorange="reversed"),
-                        height=210,
-                        margin=dict(l=0, r=60, t=8, b=36),
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        font=dict(size=12),
+                        xaxis=dict(title="Confidence", range=[0, min(1.0, results[0]["confidence"]*1.4)],
+                                   gridcolor="#1E1E1E", color="#6A5A4A"),
+                        yaxis=dict(autorange="reversed", color="#6A5A4A"),
+                        height=200,
+                        margin=dict(l=0,r=60,t=4,b=30),
+                        plot_bgcolor="#111", paper_bgcolor="#111",
+                        font=dict(size=12, color="#E8E0D8"),
                         showlegend=False,
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Techniques that matched
-                    with st.expander(f"Matched techniques ({len(parsed)} submitted)"):
-                        import joblib as _jl
-                        fv = _jl.load(ARTIFACTS / "feature_vocab.joblib")
-                        matched = [t for t in [
-                            t.split(".")[0] if "." in t else t for t in parsed
-                        ] if t in fv]
-                        unknown = [t for t in parsed if (t.split(".")[0] if "." in t else t) not in fv]
-                        if matched:
-                            st.success(f"**{len(matched)} known:** {', '.join(sorted(set(matched)))}")
+                    with st.expander("Matched / Unknown technique IDs"):
+                        matched_ids = [t.split(".")[0] if "." in t else t for t in parsed]
+                        known   = [t for t in matched_ids if t in feature_vocab]
+                        unknown = [t for t in parsed if (t.split(".")[0] if "." in t else t) not in feature_vocab]
+                        if known:
+                            st.success(f"**{len(known)} known:** {', '.join(sorted(set(known)))}")
                         if unknown:
-                            st.warning(f"**{len(unknown)} unknown (skipped):** {', '.join(unknown)}")
+                            st.warning(f"**{len(unknown)} skipped (not in vocab):** {', '.join(unknown)}")
 
                 except ValueError as e:
                     st.error(str(e))
                 except Exception as e:
                     st.error(f"Unexpected error: {e}")
-
     else:
         st.markdown("""
-<div style="border:1.5px dashed rgba(128,128,128,0.2); border-radius:10px;
-            padding:40px 20px; text-align:center; color:rgba(128,128,128,0.5);">
-  <div style="font-size:32px; margin-bottom:8px;"></div>
+<div class="empty-state">
+  <div style="font-size:36px;margin-bottom:10px;"></div>
   <div style="font-size:14px;">Enter technique IDs and click <strong>Attribute →</strong></div>
-</div>
-""", unsafe_allow_html=True)
+  <div style="font-size:12px;margin-top:6px;opacity:.7;">Or load a preset from the sidebar</div>
+</div>""", unsafe_allow_html=True)
 
-# ── SHAP panel ────────────────────────────────────────────────
 st.divider()
 
-with st.expander(" SHAP Feature Importance — which techniques drive predictions?"):
-    if shap_table:
-        top_n  = st.slider("Show top N techniques", 5, min(30, len(shap_table)), 15)
-        rows   = shap_table[:top_n]
-        tids   = [r["technique_id"]  for r in rows]
-        vals   = [r["mean_abs_shap"] for r in rows]
+# ─── ABOUT (accordion dropdowns) ─────────────────────────────────────────────
+st.markdown('<div class="sec-lbl">About This System</div>', unsafe_allow_html=True)
 
-        fig2 = go.Figure(go.Bar(
-            x=vals[::-1], y=tids[::-1],
-            orientation="h",
-            marker=dict(
-                color=vals[::-1],
-                colorscale=[[0,"#E1F5EE"],[0.5,"#1D9E75"],[1,"#085041"]],
-                showscale=False,
-            ),
-            text=[f"{v:.4f}" for v in vals[::-1]],
-            textposition="outside",
-            cliponaxis=False,
-        ))
-        fig2.update_layout(
-            xaxis_title="Mean |SHAP value|",
-            height=max(300, top_n * 22),
-            margin=dict(l=0, r=60, t=8, b=30),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-        st.caption(
-            "SHAP values computed on XGBoost base estimator across all test samples. "
-            "Higher = more discriminative for attributing groups."
-        )
-    else:
-        st.info("Run notebook 03_evaluation.ipynb first to generate SHAP data.")
+about_items = [
+    ("", "What is APT Attribution?",
+     "Advanced Persistent Threats (APTs) are sophisticated, state-sponsored hacking groups. While attackers frequently rotate infrastructure, they rarely change their <em>Tactics, Techniques and Procedures (TTPs)</em>. This engine parses the MITRE ATT&CK STIX 2.1 database — containing signatures for 170+ tracked global threat groups — and trains an ensemble ML classifier to attribute unknown incidents to the most likely threat actor based on observed techniques."),
 
-# ── engineering report panel ──────────────────────────────────
-with st.expander(" Evaluation Summary"):
-    if eval_summary:
-        c1, c2, c3, c4 = st.columns(4)
-        def pill(col, val, lbl, ok=None):
-            icon = ("✓ " if ok else "✗ " if ok is False else "") if ok is not None else ""
-            col.metric(lbl, f"{icon}{val:.4f}" if isinstance(val, float) else str(val))
-        pill(c1, eval_summary.get("macro_f1",        0), "Macro F1",
-             ok=eval_summary.get("macro_f1", 0) >= eval_summary.get("target_macro_f1", 0.62))
-        pill(c2, eval_summary.get("top3_accuracy",   0), "Top-3 Accuracy",
-             ok=eval_summary.get("top3_accuracy", 0) >= eval_summary.get("target_top3_acc", 0.80))
-        pill(c3, eval_summary.get("macro_precision",0), "Macro Precision")
-        pill(c4, eval_summary.get("macro_recall",   0), "Macro Recall")
+    ("", "Model Architecture",
+     "<b>Ensemble:</b> Soft-voting classifier combining three base models:<br>"
+     "• <code>XGBoost</code> (hist tree, mlogloss, weighted x2–x4)<br>"
+     "• <code>Random Forest</code> (balanced_subsample class weighting)<br>"
+     "• <code>Calibrated SVM</code> (linear kernel, isotonic calibration)<br><br>"
+     "<b>Tuning:</b> Optuna with TPE sampler, 60 trials, macro F1 objective, StratifiedKFold CV.<br>"
+     "<b>Imbalance handling:</b> SMOTE on training set only (k=2). 30 synthetic samples per group via random technique sub-sampling."),
 
-        st.caption(f"Eval method: `{eval_summary.get('eval_method', '—')}`  ·  "
-                   f"{eval_summary.get('n_test_samples','—')} test samples  ·  "
-                   f"{eval_summary.get('n_failing_groups','—')} groups with F1=0")
+    ("", "Feature Engineering",
+     "Each threat group is represented as a <b>sparse binary vector</b> over all unique ATT&CK technique IDs.<br><br>"
+     "• <b>Root-only mode:</b> Sub-technique IDs (T1059.001) are collapsed to root (T1059). This reduces feature space while retaining discriminative signal for sparse groups.<br>"
+     "• <b>Shape:</b> (n_groups × n_techniques) CSR sparse matrix.<br>"
+     "• <b>Sparsity:</b> >95% — most groups use a small fraction of all techniques."),
 
-        note = eval_summary.get("note", "")
-        if note:
-            st.warning(f"⚠ {note}")
-    else:
-        st.info("Run notebook 03_evaluation.ipynb to generate eval_summary.json.")
+    ("", "Known Limitations",
+     "• Groups with fewer than 3 recorded techniques are excluded from training — too few signal points for reliable attribution.<br>"
+     "• Single-sample classes (groups with only 1 training example after augmentation) never appear in the test set — metrics are computed only on verifiable classes.<br>"
+     "• False-flag contamination: attackers deliberately reuse other groups' tools. The model looks for <em>combinations</em> of techniques, but adversarial cross-contamination can lower confidence.<br>"
+     "• The dataset reflects what the community has <em>publicly documented</em> — novel or low-profile groups are underrepresented."),
+
+    ("", "Evaluation Strategy",
+     "Because each ATT&CK group originally has exactly 1 row in the raw feature matrix, we use a <b>data augmentation + held-out test set</b> strategy:<br><br>"
+     "1. Generate 30 synthetic sub-samples per group (random technique subsets)<br>"
+     "2. Stratified 80/20 train/test split on augmented data<br>"
+     "3. Single-sample classes forced into train only<br>"
+     "4. Metrics: Macro Precision, Recall, F1 · Top-3 Accuracy · Per-class report · Confusion matrix<br>"
+     "5. Explainability: SHAP TreeExplainer on XGBoost base (mean |SHAP| per technique)"),
+]
+
+for icon, title, body in about_items:
+    st.markdown(f"""
+<details class="about-item">
+  <summary>{icon}&nbsp;&nbsp;{title}</summary>
+  <div class="body">{body}</div>
+</details>
+""", unsafe_allow_html=True)
