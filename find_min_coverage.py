@@ -33,7 +33,7 @@ feature_vocab = joblib.load(ARTIFACTS / "feature_vocab.joblib")
 all_tids = sorted(feature_vocab, key=feature_vocab.get)
 all_labels = sorted(set(y))
 
-GROUPS_TO_TEST = ["APT28", "Lazarus Group", "APT29", "APT41", "MuddyWater"]
+GROUPS_TO_TEST = ["APT28", "Lazarus Group", "APT29", "APT41", "MuddyWater", "Sandworm Team"]
 
 TRIALS_PER_COUNT = 15          # random subsets drawn per technique-count
 CANDIDATE_COUNTS = [5, 8, 10, 12, 15, 18, 20, 25, 30, 35, 40, 50]

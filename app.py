@@ -38,8 +38,8 @@ def load_description_pipeline():
     from sentence_transformers import SentenceTransformer
     from description_mapper import load_pipeline
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    corpus, alias_table, tids, technique_embeddings = load_pipeline(model)
-    return model, corpus, alias_table, tids, technique_embeddings
+    corpus, alias_table, tids, technique_embeddings, idf_table = load_pipeline(model)
+    return model, corpus, alias_table, tids, technique_embeddings, idf_table
 
 # ─── APT group → country/region mapping ─────────────────────────────────────
 APT_COUNTRY = {
@@ -694,10 +694,10 @@ descriptions may map to fewer than that.
             else:
                 try:
                     with st.spinner("Loading NLP pipeline (first run only)…"):
-                        model, corpus, alias_table, tids, technique_embeddings = load_description_pipeline()
+                        model, corpus, alias_table, tids, technique_embeddings, idf_table = load_description_pipeline()
                     from description_mapper import attribute_from_description
                     technique_ids, mapped_details, run_results, coverage_warning = attribute_from_description(
-                        description_input, corpus, alias_table, tids, technique_embeddings, model,
+                        description_input, corpus, alias_table, tids, technique_embeddings, model, idf_table=idf_table,
                     )
                 except ValueError as e:
                     run_error = str(e)

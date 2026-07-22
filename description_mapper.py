@@ -173,6 +173,49 @@ def build_software_alias_table(bundle, stix_id_to_tid):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 3b. Technique discriminativeness (IDF), computed from the ACTUAL trained
+#     model's data (X.joblib/y.joblib) — not MITRE's full dataset. This
+#     tells us which techniques are rare/specific among the groups the
+#     model actually learned to distinguish, vs. generic techniques that
+#     appear in most groups and therefore carry little discriminating
+#     power. Same idea as the TF-IDF strategy already noted in the
+#     evaluation notebook, applied here to re-rank mapped techniques.
+# ─────────────────────────────────────────────────────────────────────────
+
+def build_technique_idf(feature_vocab_path=None, x_path=None, y_path=None):
+    cache_path = CACHE_DIR / "technique_idf.json"
+    if cache_path.exists():
+        return json.loads(cache_path.read_text())
+
+    import joblib
+    feature_vocab = joblib.load(feature_vocab_path or (ARTIFACTS / "feature_vocab.joblib"))
+    X = joblib.load(x_path or (ARTIFACTS / "X.joblib"))
+    y = np.array(joblib.load(y_path or (ARTIFACTS / "y.joblib")))
+    all_tids = sorted(feature_vocab, key=feature_vocab.get)
+
+    # reconstruct each group's fullest signature (same method used
+    # throughout this project) to get one row per REAL group, not per
+    # augmented/dropout sample — augmentation duplicates would otherwise
+    # skew document frequency toward whichever groups got more copies.
+    group_rows = []
+    for label in sorted(set(y)):
+        idx = np.where(y == label)[0]
+        row_sums = X[idx].sum(axis=1)
+        group_rows.append(X[idx[np.argmax(row_sums)]])
+    group_matrix = np.vstack(group_rows)  # (n_groups, n_features)
+
+    n_groups = group_matrix.shape[0]
+    doc_freq = (group_matrix > 0).sum(axis=0)  # how many groups use each technique
+
+    idf_raw = np.log((n_groups + 1) / (doc_freq + 1)) + 1
+    idf_norm = (idf_raw - idf_raw.min()) / (idf_raw.max() - idf_raw.min() + 1e-9)
+
+    idf_table = {all_tids[i]: float(idf_norm[i]) for i in range(len(all_tids))}
+    cache_path.write_text(json.dumps(idf_table))
+    return idf_table
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 4. Embeddings for the technique corpus (semantic layer)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -205,9 +248,10 @@ def load_pipeline(model):
     corpus, stix_id_to_tid = build_technique_corpus(bundle)
     alias_table = build_software_alias_table(bundle, stix_id_to_tid)
     tids, technique_embeddings = build_technique_embeddings(corpus, model)
+    idf_table = build_technique_idf()
     print(f"Loaded {len(corpus)} techniques and {len(alias_table)} software "
           f"names/aliases from MITRE's own data.")
-    return corpus, alias_table, tids, technique_embeddings
+    return corpus, alias_table, tids, technique_embeddings, idf_table
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -235,7 +279,7 @@ MIN_SEMANTIC_SLOTS = 10
 
 def map_description_to_techniques(
     description, corpus, alias_table, tids, technique_embeddings, model,
-    top_k=35, similarity_threshold=0.25,
+    idf_table=None, top_k=30, similarity_threshold=0.30,
 ):
     """
     Returns (technique_ids, match_details, coverage_warning_or_None).
@@ -249,7 +293,27 @@ def map_description_to_techniques(
       B) semantic similarity between description sentences and MITRE's
          own technique name+description text — guaranteed a minimum number
          of result slots so tool mentions can't crowd it out entirely.
+
+    Both layers' scores are then re-weighted by idf_table (if provided) —
+    a discriminativeness score computed from the ACTUAL trained model's
+    groups (build_technique_idf()). Techniques that are rare/specific
+    among trained groups get a modest boost; techniques nearly every
+    group shares get a modest penalty. This nudges ranking toward
+    techniques that actually help distinguish groups, without changing
+    which techniques get matched in the first place.
     """
+    idf_table = idf_table or {}
+
+    def idf_multiplier(tid):
+        # neutral (1.0) if unknown; scaled into a NARROWER [0.85, 1.15] band —
+        # a wider band let weak-but-rare semantic matches (score ~0.4) get
+        # boosted above stronger, more relevant ones, occasionally pulling
+        # toward small/narrow groups that happen to share one rare
+        # technique rather than the correct broad group. This is a
+        # deliberately gentle nudge, not a re-ranking override.
+        idf_val = idf_table.get(tid, 0.5)
+        return 0.85 + 0.3 * idf_val
+
     alias_matches = {}  # tid -> (score, reason)
     desc_lower = description.lower()
 
@@ -276,9 +340,10 @@ def map_description_to_techniques(
         # cap contribution so one tool can't fill the whole result
         capped = sw_techniques[:MAX_TECHNIQUES_PER_SOFTWARE]
         for tid in capped:
+            weighted_score = base_score * idf_multiplier(tid)
             prev = alias_matches.get(tid, (0, ""))
-            if base_score > prev[0]:
-                alias_matches[tid] = (base_score, reason_tag)
+            if weighted_score > prev[0]:
+                alias_matches[tid] = (weighted_score, reason_tag)
 
     # ── B) semantic match ──
     sentences = [s.strip() for s in re.split(r"[.\n;]", description) if s.strip()]
@@ -296,9 +361,10 @@ def map_description_to_techniques(
             if score < similarity_threshold:
                 continue
             tid = tids[i]
+            weighted_score = score * idf_multiplier(tid)
             prev = semantic_matches.get(tid, (0, ""))
-            if score > prev[0]:
-                semantic_matches[tid] = (score, f"semantic match ({score:.2f})")
+            if weighted_score > prev[0]:
+                semantic_matches[tid] = (weighted_score, f"semantic match ({score:.2f} × idf)")
 
     # ── merge: guarantee semantic matches a minimum number of slots ──
     semantic_ranked = sorted(semantic_matches.items(), key=lambda kv: kv[1][0], reverse=True)
@@ -348,12 +414,12 @@ def map_description_to_techniques(
 # 7. End-to-end: description -> technique IDs -> predict_top3()
 # ─────────────────────────────────────────────────────────────────────────
 
-def attribute_from_description(description, corpus, alias_table, tids, technique_embeddings, model):
+def attribute_from_description(description, corpus, alias_table, tids, technique_embeddings, model, idf_table=None):
     sys.path.insert(0, str(ROOT))
     from inference import predict_top3  # UNCHANGED — existing model
 
     technique_ids, match_details, coverage_warning = map_description_to_techniques(
-        description, corpus, alias_table, tids, technique_embeddings, model,
+        description, corpus, alias_table, tids, technique_embeddings, model, idf_table=idf_table,
     )
     if not technique_ids:
         raise ValueError(
@@ -376,7 +442,7 @@ if __name__ == "__main__":
     print("Loading sentence-embedding model (pretrained, no training needed)...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    corpus, alias_table, tids, technique_embeddings = load_pipeline(model)
+    corpus, alias_table, tids, technique_embeddings, idf_table = load_pipeline(model)
 
     example_description = """
     The attacker sent a spearphishing email with a malicious attachment to
@@ -393,7 +459,7 @@ if __name__ == "__main__":
     print(f"\nDescription:\n{example_description.strip()}")
 
     technique_ids, match_details, group_predictions, coverage_warning = attribute_from_description(
-        example_description, corpus, alias_table, tids, technique_embeddings, model,
+        example_description, corpus, alias_table, tids, technique_embeddings, model, idf_table=idf_table,
     )
 
     print(f"\nMapped technique IDs ({len(technique_ids)}):")
